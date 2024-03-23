@@ -1,10 +1,12 @@
 #include "LiveDebugVariables.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
+#include "llvm/CodeGen/CodeGenPassBuilder.h"
 #include "llvm/CodeGen/LiveInterval.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
@@ -40,6 +42,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Printable.h"
 #include <_types/_uint16_t.h>
 #include <cstdio>
 #include <deque>
@@ -57,7 +60,7 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "regalloc"
-#define SOLVER_COMMAND "gurobi_cl ResultFile=solution.sol"
+#define SOLVER_COMMAND "gurobi_cl ResultFile=solution.sol TimeLimit=60"
 
 static RegisterRegAlloc PboUpdatedRegAlloc("pbo-updated", "PBO updated register allocator", createPBOUpdatedRegisterAllocator);
 
@@ -69,6 +72,7 @@ namespace {
 class PBORegAllocUpdated : public MachineFunctionPass {
 
   MachineFunction *MachineFunction;
+  VirtRegMap *VirtRegMap;
   LiveIntervals *LiveIntervals;
   LiveRegMatrix *LiveRegMatrix;
   MachineRegisterInfo *MachineRegisterInfo;
@@ -104,7 +108,8 @@ class PBORegAllocUpdated : public MachineFunctionPass {
   std::map<MCPhysReg, idx_t> DestToReg;
 
   std::vector<std::pair<MCPhysReg, idx_t>> ToZero;
-  std::set<MCPhysReg> Starts;
+  std::map<MCPhysReg, bool> Starts;
+  std::set<MCPhysReg> Ends;
 
 public:
   PBORegAllocUpdated(const RegClassFilterFunc F = allocateAllRegClasses);
@@ -131,10 +136,10 @@ public:
   void instrConditions(const MachineInstr &, idx_t, bool);
 
   void genStoreConditions(void);
+  void genLiveRestrictions(void);
   void genConflictConditions(void);
   void genEndingRestrictions(void);
 
-  void genObjectiveFunction(void);
   void mixSwapPenalty(void);
 
   void genAssignments();
@@ -142,6 +147,8 @@ public:
   void assignPhysRegisters(void);
 
   int getStackSlot(Register Reg);
+  int getStackSlot(const TargetRegisterClass &);
+  void addMBBLiveIns(void);
 
   static char ID;
 
@@ -157,6 +164,11 @@ char PBORegAllocUpdated::ID = 0;
 
 INITIALIZE_PASS_BEGIN(PBORegAllocUpdated, "regallocpboupdated", 
                       "Updated PBO Allocator", false, false)
+INITIALIZE_PASS_DEPENDENCY(VirtRegMap)
+INITIALIZE_PASS_DEPENDENCY(SlotIndexes)
+INITIALIZE_PASS_DEPENDENCY(LiveIntervals)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
+INITIALIZE_PASS_DEPENDENCY(LiveRegMatrix)
 INITIALIZE_PASS_END(PBORegAllocUpdated, "regallocpboupdated", 
                     "Updated PBO Allocator", false, false)
 
@@ -165,13 +177,13 @@ PBORegAllocUpdated::PBORegAllocUpdated(RegClassFilterFunc F) : MachineFunctionPa
 void PBORegAllocUpdated::getAnalysisUsage(AnalysisUsage &AUsage) const {
   AUsage.setPreservesCFG();
   AUsage.addRequired<llvm::LiveIntervals>();
-  AUsage.addPreserved<llvm::LiveIntervals>();
-  AUsage.addPreserved<llvm::SlotIndexes>();
   AUsage.addRequired<llvm::SlotIndexes>();
   AUsage.addRequired<llvm::MachineBlockFrequencyInfo>();
   AUsage.addPreserved<llvm::MachineBlockFrequencyInfo>();
   AUsage.addRequired<llvm::LiveRegMatrix>();
   AUsage.addPreserved<llvm::LiveRegMatrix>();
+  AUsage.addRequired<llvm::VirtRegMap>();
+  AUsage.addPreserved<llvm::VirtRegMap>();
   MachineFunctionPass::getAnalysisUsage(AUsage);
 }
 
@@ -199,9 +211,7 @@ void PBORegAllocUpdated::instrConditions(const MachineInstr &Instr, idx_t VirtId
   for (size_t PhysIdx = 0; PhysIdx < PhysRegCount; ++PhysIdx) {
     std::string LogVar = genLogVar();
     PhysLogVarSets[VirtIdx][SegIdx][PhysSets[VirtIdx][PhysIdx]] = LogVar;
-    if (PhysIdx < 3) {
-      ObjectiveFunction += " -1 " + LogVar;
-    }
+    ObjectiveFunction += " -" + std::to_string((PhysRegCount - PhysIdx) / (float) PhysRegCount) + " " + LogVar;
     ConstraintFile << " +1 " << LogVar;
   }
 
@@ -214,17 +224,18 @@ void PBORegAllocUpdated::instrConditions(const MachineInstr &Instr, idx_t VirtId
   ConstraintFile << " = 1;\n";
   ConstraintCount++;
 
-  // Implicit Def Conditions
+  // Implicit Conditions
 
-  const MCInstrDesc &Desc = TargetInstrInfo->get(Instr.getOpcode());
-
-  for (MCPhysReg PhysReg : Desc.implicit_defs()) {
-    if (PhysLogVarSets[VirtIdx][SegIdx].find(PhysReg) == PhysLogVarSets[VirtIdx][SegIdx].end()) {
+  for (MachineOperand Operand : Instr.operands()) {
+    if (Operand.isRegMask()) {
+      for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
+        if (Operand.clobbersPhysReg(PhysReg)) {
+          ConstraintFile << " +1 " << PhysLogVarSets[VirtIdx][SegIdx][PhysReg] << " = 0;\n";
+          ConstraintCount++;
+        }
+      }
       continue;
     }
-
-    ConstraintFile << " +1 " << PhysLogVarSets[VirtIdx][SegIdx][PhysReg] << " = 0;\n";
-    ConstraintCount++;
   }
 }
 
@@ -244,6 +255,9 @@ void PBORegAllocUpdated::genStoreConditions(void) {
       if (MachineRegisterInfo->isReserved(*PhysRegIt)) {
         continue;
       }
+      if (LiveRegMatrix->checkInterference(LiveInterval, *PhysRegIt) != llvm::LiveRegMatrix::IK_Free) {
+        continue;
+      }
       if (MachineRegisterInfo->isAllocatable(*PhysRegIt)) {
         PhysSets[VirtIdx].push_back(*PhysRegIt);
       } 
@@ -257,12 +271,14 @@ void PBORegAllocUpdated::genStoreConditions(void) {
       instrConditions(*DefIt, VirtIdx, false);
     }
 
-    for (MachineRegisterInfo::use_instr_iterator UseIt = MachineRegisterInfo->use_instr_begin(VirtReg);
-         UseIt != MachineRegisterInfo::use_instr_end(); ++UseIt) {
+    for (MachineRegisterInfo::use_instr_nodbg_iterator UseIt = MachineRegisterInfo->use_instr_nodbg_begin(VirtReg);
+         UseIt != MachineRegisterInfo::use_instr_nodbg_end(); ++UseIt) {
+
       instrConditions(*UseIt, VirtIdx, false);
     }
 
     for (llvm::LiveInterval::iterator IntIt = LiveInterval.begin(); IntIt != LiveInterval.end(); ++IntIt) {
+      // LLVM_DEBUG(dbgs() << "START: "; IntIt->start.print(dbgs()); dbgs() << " "; dbgs() << "END: "; IntIt->end.print(dbgs()); dbgs() << "\n");
       for (SlotIndex SegIdx = IntIt->start.getBaseIndex(); SegIdx <= IntIt->end; SegIdx = SegIdx.getNextIndex()) {
         MachineInstr *Instr = SlotIndexes->getInstructionFromIndex(SegIdx);
 
@@ -270,7 +286,7 @@ void PBORegAllocUpdated::genStoreConditions(void) {
           continue;
         }
 
-        instrConditions(*Instr, VirtIdx, true);        
+        instrConditions(*Instr, VirtIdx, true);
       }
     }
 
@@ -285,15 +301,13 @@ void PBORegAllocUpdated::genConflictConditions(void) {
       for (std::set<idx_t>::iterator RegIt2 = std::next(RegIt1, 1); RegIt2 != SlotIt->second.end(); ++RegIt2) {
         for (MCPhysReg PhysReg1 : PhysSets[*RegIt1]) {
           for (MCPhysReg PhysReg2 : PhysSets[*RegIt2]) {
-            if (PhysReg1 != PhysReg2) {
-              continue;
+            if (TargetRegisterInfo->regsOverlap(PhysReg1, PhysReg2)) {
+              ConstraintFile << " +1 " << PhysLogVarSets[*RegIt1][SlotIt->first][PhysReg1] 
+                             << " +1 " << PhysLogVarSets[*RegIt2][SlotIt->first][PhysReg2]
+                             << " <= 1;\n";
+
+              ConstraintCount++;
             }
-
-            ConstraintFile << " +1 " << PhysLogVarSets[*RegIt1][SlotIt->first][PhysReg1] 
-                           << " +1 " << PhysLogVarSets[*RegIt2][SlotIt->first][PhysReg2]
-                           << " <= 1;\n";
-
-            ConstraintCount++;
           }
         }
       }
@@ -304,12 +318,19 @@ void PBORegAllocUpdated::genConflictConditions(void) {
 void PBORegAllocUpdated::genEndingRestrictions(void) {
   ConstraintFile << "* Ending Restrictions\n";
   for (MachineBasicBlock &BasicBlock : *MachineFunction) {
-    SlotIndex LastIdx = SlotIndexes->getInstructionIndex(BasicBlock.instr_back()).getBaseIndex();
+    if (BasicBlock.empty()) {
+      continue;
+    }
+
+    SlotIndex LastIdx = SlotIndexes->getInstructionIndex(*BasicBlock.getLastNonDebugInstr()).getBaseIndex();
     std::set<idx_t> *ExitLiveVirts = &SlotQueue[LastIdx];
 
     for (MachineBasicBlock *Successor : BasicBlock.successors()) {
+      if (Successor->empty()) {
+        continue;
+      }
 
-      SlotIndex FirstIdx = SlotIndexes->getInstructionIndex(Successor->instr_front()).getBaseIndex();
+      SlotIndex FirstIdx = SlotIndexes->getInstructionIndex(*Successor->getFirstNonDebugInstr()).getBaseIndex();
       std::set<idx_t> *EntryLiveVirts = &SlotQueue[FirstIdx];
 
       for (idx_t ExitIdx : *ExitLiveVirts) {
@@ -337,51 +358,66 @@ void PBORegAllocUpdated::genEndingRestrictions(void) {
   }
 }
 
-void PBORegAllocUpdated::genObjectiveFunction(void) {
-  idx_t VirtIdx = 0;
-  for (Register VirtReg : VirtRegs) {
-    for (MachineRegisterInfo::use_instr_iterator UseIt = MachineRegisterInfo->use_instr_begin(VirtReg);
-         UseIt != MachineRegisterInfo::use_instr_end(); ++UseIt) {
-      int Expected = MachineBlockFrequencyInfo->getBlockFreq(UseIt->getParent()).getFrequency() / MachineBlockFrequencyInfo->getEntryFreq().getFrequency();
-      SlotIndex UseIdx = SlotIndexes->getInstructionIndex(*UseIt);
-      SlotIndex PrevIdx = UseIdx.getPrevIndex();
-
-      for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
-        ObjectiveFunction += " -" + std::to_string((int)Expected) + " " 
-                          + PhysLogVarSets[VirtIdx][UseIdx][PhysReg] + " " 
-                          + PhysLogVarSets[VirtIdx][PrevIdx][PhysReg];
-      }
+void PBORegAllocUpdated::mixSwapPenalty(void) {
+  for (MachineBasicBlock &MachineBasicBlock : *MachineFunction) {
+    if (MachineBasicBlock.empty()) {
+      continue;
     }
 
-    VirtIdx++;
-  }
-}
+    MachineInstr &StartInstr = *MachineBasicBlock.getFirstNonDebugInstr();
+    SlotIndex StartIdx = SlotIndexes->getInstructionIndex(StartInstr);
+    double Expected = 20 * MachineBlockFrequencyInfo->getBlockFreqRelativeToEntryBlock(&MachineBasicBlock);
 
-void PBORegAllocUpdated::mixSwapPenalty(void) {
-  idx_t VirtIdx = 0;
-  for (Register VirtReg : VirtRegs) {
-    LiveInterval &LiveInterval = LiveIntervals->getInterval(VirtReg);
+    std::map<idx_t, std::map<MCPhysReg, std::string>> PrevMap = {};
+    std::map<idx_t, std::string> PrevSpill = {};
 
-    for (llvm::LiveInterval::iterator IntIt = LiveInterval.begin(); IntIt != LiveInterval.end(); ++IntIt) {
-      std::map<MCPhysReg, std::string> PrevMap = PhysLogVarSets[VirtIdx][IntIt->start.getBaseIndex()];
-      for (SlotIndex SegIdx = IntIt->start.getNextIndex().getBaseIndex(); SegIdx <= IntIt->end; SegIdx = SegIdx.getNextIndex()) {
-        MachineInstr *Instr = SlotIndexes->getInstructionFromIndex(SegIdx);
+    for (idx_t VirtIdx : SlotQueue[StartIdx]) {
+      for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
+        PrevMap[VirtIdx][PhysReg] = PhysLogVarSets[VirtIdx][StartIdx][PhysReg];
+      }
 
-        if (Instr == nullptr) {
+      if (SpillLogVarSets[VirtIdx].find(StartIdx) != SpillLogVarSets[VirtIdx].end()) {
+        PrevSpill[VirtIdx] = SpillLogVarSets[VirtIdx][StartIdx];
+      } 
+    }
+
+    llvm::MachineBasicBlock::instr_iterator InstIt = MachineBasicBlock.instr_begin();
+    for (InstIt++; InstIt != MachineBasicBlock.instr_end(); ++InstIt) {
+      if (InstIt->isDebugInstr()) {
+        continue;
+      }
+
+      SlotIndex Idx = SlotIndexes->getInstructionIndex(*InstIt);
+
+      std::map<idx_t, std::map<MCPhysReg, std::string>> CurMap = {};
+      std::map<idx_t, std::string> CurSpill = {};
+
+      for (idx_t VirtIdx : SlotQueue[Idx]) {
+        if (PrevMap.find(VirtIdx) == PrevMap.end()) {
+          CurMap[VirtIdx] = PhysLogVarSets[VirtIdx][Idx];
           continue;
         }
 
-        int Expected = MachineBlockFrequencyInfo->getBlockFreq(Instr->getParent()).getFrequency() / MachineBlockFrequencyInfo->getEntryFreq().getFrequency();
-
-        for (std::pair<MCPhysReg, std::string> Entry : PhysLogVarSets[VirtIdx][SegIdx]) {
-          ObjectiveFunction += " -" + std::to_string((int)Expected * 50) + " " + Entry.second + " " + PrevMap[Entry.first];
+        for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
+          ObjectiveFunction += " -" + std::to_string(Expected) + " " + PrevMap[VirtIdx][PhysReg] + " " + PhysLogVarSets[VirtIdx][Idx][PhysReg];
         }
 
-        PrevMap = PhysLogVarSets[VirtIdx][SegIdx];
-      }
-    }
+        bool CanSpill = SpillLogVarSets[VirtIdx].find(Idx) != SpillLogVarSets[VirtIdx].end();
 
-    VirtIdx++;
+        if (CanSpill) {
+          CurSpill[VirtIdx] =  SpillLogVarSets[VirtIdx][Idx];
+
+          if (PrevSpill.find(VirtIdx) != PrevSpill.end()) {
+            ObjectiveFunction += " -" + std::to_string(Expected / 2) + " " + PrevSpill[VirtIdx] + " " + CurSpill[VirtIdx];
+          }
+        }
+
+        CurMap[VirtIdx] = PhysLogVarSets[VirtIdx][Idx];
+      }
+
+      PrevMap = CurMap;
+      PrevSpill = CurSpill;
+    }
   }
 }
 
@@ -403,7 +439,7 @@ void PBORegAllocUpdated::genAssignments() {
 
     File.close();
   } else {
-    LLVM_DEBUG(dbgs() << "Couldn't open solutions\n");
+    // LLVM_DEBUG(dbgs() << "Couldn't open solutions\n");
   }
 
   idx_t VirtIdx = 0;
@@ -414,18 +450,36 @@ void PBORegAllocUpdated::genAssignments() {
 
     for (llvm::LiveInterval::iterator IntIt = LiveInterval.begin(); IntIt != LiveInterval.end(); ++IntIt) {
       for (SlotIndex SegIdx = IntIt->start.getBaseIndex(); SegIdx <= IntIt->end; SegIdx = SegIdx.getNextIndex()) {
+        MachineInstr *Instr = SlotIndexes->getInstructionFromIndex(SegIdx);
+
+        if (Instr == nullptr) {
+          continue;
+        }
+
+        // LLVM_DEBUG(dbgs() << "INSTR: "; Instr->print(dbgs()));
+
         RegAssignments[VirtIdx][SegIdx] = 0;
+        // LLVM_DEBUG(dbgs() << printReg(VirtRegs[VirtIdx]) << " <- ");
         for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
           if (LogVarAssignments[PhysLogVarSets[VirtIdx][SegIdx][PhysReg]]) {
             RegAssignments[VirtIdx][SegIdx] = PhysReg;
+            // LLVM_DEBUG(dbgs() << printReg(PhysReg) << "\n");
             break;
           }
+          // LLVM_DEBUG(dbgs() << "0\n");
         }
       }
     }
 
     VirtIdx++;
   }
+
+  // for (auto Entry : SlotQueue) {
+  //   LLVM_DEBUG(dbgs() << "INSTR: "; SlotIndexes->getInstructionFromIndex(Entry.first)->print(dbgs()));
+  //   for (idx_t VirtIdx : Entry.second) {
+  //     LLVM_DEBUG(dbgs() << printReg(VirtRegs[VirtIdx]) << " -> " << printReg(RegAssignments[VirtIdx][Entry.first]) << "\n");
+  //   }
+  // }
 }
 
 void PBORegAllocUpdated::substOperand(MachineBasicBlock::instr_iterator &Inst, SlotIndex InstIdx) {
@@ -442,63 +496,99 @@ void PBORegAllocUpdated::substOperand(MachineBasicBlock::instr_iterator &Inst, S
 
     idx_t VirtIdx = VirtIdxes[Reg];
 
-    LLVM_DEBUG(dbgs() << printReg(Reg) << " " << VirtIdx << " " << InstIdx << " " << printReg(RegAssignments[VirtIdx][InstIdx]) << "\n");
-
     Operand.substPhysReg(RegAssignments[VirtIdx][InstIdx], *TargetRegisterInfo);
   }
 }
 
 void PBORegAllocUpdated::addEdge(std::pair<MCPhysReg, MCPhysReg> Move, idx_t VirtIdx) {
+  LLVM_DEBUG(dbgs() << "Move: " << printReg(Move.first) << " -> " << printReg(Move.second) << "\n");
   if (Move.second == 0) {
     ToZero.push_back(std::pair<MCPhysReg, idx_t>{Move.first, VirtIdx});
     return;
   }
 
-  Starts.insert(Move.second);
+  Starts[Move.second] = false;
+
+  if (Starts.find(Move.first) != Starts.end()) {
+    Starts[Move.first] = true;
+
+    if (Ends.find(Move.second) != Ends.end()) {
+      MCPhysReg TermReg = Move.second;
+
+      MCPhysReg CurReg = Move.first;
+      while (DestToSrc.find(CurReg) != DestToSrc.end()) {
+        CurReg = DestToSrc[CurReg];
+      }
+
+      if (CurReg != TermReg) {
+        Starts[Move.second] = true;
+      }
+    }
+  } else {
+    if (Ends.find(Move.second) != Ends.end()) {
+      Starts[Move.second] = true;
+    }
+  }
+
+  Ends.insert(Move.first);
+
   DestToSrc[Move.second] = Move.first;
   DestToReg[Move.second] = VirtIdx;
 }
 
 void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm::MachineBasicBlock::instr_iterator &InsertIt) {
+  LLVM_DEBUG(dbgs() << "START: "; InsertIt->print(dbgs()));
+  // LLVM_DEBUG(dbgs() << "TO_ZERO\n");
   for (std::pair<MCPhysReg, idx_t> Blunt : ToZero) {
-    Register VirtReg = VirtRegs[DestToReg[Blunt.second]];
+    Register VirtReg = VirtRegs[Blunt.second];
     int FrameIdx = getStackSlot(VirtReg);
     const TargetRegisterClass &RegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
 
     TargetInstrInfo->storeRegToStackSlot(MachineBasicBlock, InsertIt, Blunt.first, true, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
+    SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+    // LLVM_DEBUG(dbgs() << printReg(Blunt.first) << " -> " << "0" << "\n");
 
-    MCPhysReg CurReg = DestToSrc[Blunt.first];
+    MCPhysReg CurReg = Blunt.first;
     while (DestToSrc.find(CurReg) != DestToSrc.end()) {
-      VirtReg = VirtRegs[DestToReg[Blunt.second]];
-      FrameIdx = getStackSlot(VirtReg);
-
       MCPhysReg SrcReg = DestToSrc[CurReg];
       
       if (SrcReg != 0) {
-        TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), CurReg,SrcReg, true);
+        TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), CurReg, SrcReg, true);
+        SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+        // LLVM_DEBUG(dbgs() << printReg(SrcReg) << " -> " << printReg(CurReg) << "\n");
       } else {
+        VirtReg = VirtRegs[DestToReg[CurReg]];
+        FrameIdx = getStackSlot(VirtReg);
         const TargetRegisterClass &RegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
+
         TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, CurReg, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
+        SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+        // LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(CurReg) << "\n");
       }
 
-      Starts.erase(CurReg);
+      Starts[CurReg] = true;
       CurReg = SrcReg;
     }
   }
 
-  for (MCPhysReg Start : Starts) {
+  // LLVM_DEBUG(dbgs() << "STACK\n");
+  for (std::pair<MCPhysReg, bool> Start : Starts) {
+    if (Start.second) {
+      continue; 
+    }
     std::vector<MCPhysReg> Stack = {};
 
-    MCPhysReg CurReg = Start; bool Cycle = false;
+    MCPhysReg CurReg = Start.first; bool Cycle = false;
     while (DestToSrc.find(CurReg) != DestToSrc.end()) {
+      Starts[CurReg] = true;
       Stack.push_back(CurReg);
-      MCPhysReg SrcReg = DestToReg[CurReg];
+      MCPhysReg SrcReg = DestToSrc[CurReg];
 
       if (SrcReg == 0) {
         break;
       }
 
-      if (SrcReg == Start) {
+      if (SrcReg == Start.first) {
         Cycle = true;
         break;
       }
@@ -507,40 +597,55 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
     }
 
     if (Cycle) {
-      Register VirtReg = VirtRegs[DestToReg[Start]];
-      int FrameIdx = getStackSlot(-1);
+      // LLVM_DEBUG(dbgs() << "CYCLE!\n");
+      Register VirtReg = VirtRegs[DestToReg[Start.first]];
+      int FrameIdx = getStackSlot(*MachineRegisterInfo->getRegClass(VirtReg));
       const TargetRegisterClass &RegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
 
-      TargetInstrInfo->storeRegToStackSlot(MachineBasicBlock, InsertIt, Start, true, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
+      TargetInstrInfo->storeRegToStackSlot(MachineBasicBlock, InsertIt, Start.first, true, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
+      SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+      // LLVM_DEBUG(dbgs() << printReg(Start.first) << " -> " << "0" << "\n");
 
       for (idx_t Idx = 0; Idx < Stack.size() - 1; ++Idx) {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), Stack[Idx], Stack[Idx+1], true);
+        SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+        // LLVM_DEBUG(dbgs() << printReg(Stack[Idx+1]) << " -> " << printReg(Stack[Idx]) << "\n");
       }
 
       MCPhysReg LastReg = Stack[Stack.size()-1];
 
       VirtReg = VirtRegs[DestToReg[LastReg]];
-      FrameIdx = getStackSlot(-1);
       const TargetRegisterClass &LastRegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
 
       TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, LastReg, FrameIdx, &LastRegisterClass, TargetRegisterInfo, Register());
+      SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+      // LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(LastReg) << "\n");
     } else {
       for (idx_t Idx = 0; Idx < Stack.size() - 1; ++Idx) {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), Stack[Idx], Stack[Idx+1], true);
+        SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+        // LLVM_DEBUG(dbgs() << printReg(Stack[Idx+1]) << " -> " << printReg(Stack[Idx]) << "\n");
       }
       
       MCPhysReg LastReg = Stack[Stack.size()-1];
+      // LLVM_DEBUG(dbgs() << "LAST REG: " << printReg(LastReg) << " SOURCE: " << printReg(DestToSrc[LastReg]) << "\n");
       if (DestToSrc[LastReg] == 0) {
         Register VirtReg = VirtRegs[DestToReg[LastReg]];
         int FrameIdx = getStackSlot(VirtReg);
         const TargetRegisterClass &RegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
 
         TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, LastReg, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
+        SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+        // LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(LastReg) << "\n");
       } else {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), LastReg, DestToSrc[LastReg], true);
+        SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
+        // LLVM_DEBUG(dbgs() << printReg(DestToSrc[LastReg]) << " -> " << printReg(LastReg) << "\n");
+
       }
     }
   }
+
 }
 
 void PBORegAllocUpdated::clearQueue(void) {
@@ -549,6 +654,7 @@ void PBORegAllocUpdated::clearQueue(void) {
 
   ToZero = {};
   Starts = {};
+  Ends = {};
 }
 
 void PBORegAllocUpdated::assignPhysRegisters(void) {
@@ -556,17 +662,19 @@ void PBORegAllocUpdated::assignPhysRegisters(void) {
     std::map<idx_t, MCPhysReg> LiveMap = {};
 
     for (llvm::MachineBasicBlock::instr_iterator InstIt = MachineBasicBlock.instr_begin();
-         InstIt != MachineBasicBlock.end(); ++InstIt) {
-      
+         InstIt != MachineBasicBlock.instr_end(); ++InstIt) {
+
+      if (InstIt->isDebugInstr()) {
+        continue;
+      }
+
       SlotIndex InstIdx = SlotIndexes->getInstructionIndex(*InstIt).getBaseIndex();
 
       substOperand(InstIt, InstIdx);
 
-      idx_t InstInserted = 0;
-
       // This is to ensure that we do not break up the terminator block at the end of a basic block
       MachineBasicBlock::instr_iterator InsertIt = InstIt;
-      while (InsertIt->isTerminator() && InsertIt != MachineBasicBlock.instr_begin()) {
+      while (InsertIt->isTerminator() && InsertIt != MachineBasicBlock.instr_begin() && std::prev(InsertIt)->isTerminator()) {
         InsertIt--;
       }
 
@@ -584,40 +692,17 @@ void PBORegAllocUpdated::assignPhysRegisters(void) {
         if (RegAssignments[VirtIdx][InstIdx] == LiveMap[VirtIdx]) {
           continue;
         }
-        
-        addEdge(std::pair<MCPhysReg, MCPhysReg>{RegAssignments[VirtIdx][InstIdx], LiveMap[VirtIdx]}, VirtIdx);
 
-        // Register VirtReg = VirtRegs[VirtIdx];
-
-        // int FrameIdx = getStackSlot(VirtReg);
-        // const TargetRegisterClass &RegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
-
-        // if (LiveMap[VirtIdx] == 0) {
-        //   // VirtIdx was stored in the stack, need to load it into a physical register
-        //   TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, RegAssignments[VirtIdx][InstIdx], FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
-        // } 
-        // else if (RegAssignments[VirtIdx][InstIdx] == 0) {
-        //   // VirtIdx was in physical register, needs to be spilled to stack
-        //   TargetInstrInfo->storeRegToStackSlot(MachineBasicBlock, InsertIt, LiveMap[VirtIdx], true, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
-        // } 
-        // else {
-        //   // Need to move from one register into another
-        //   TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), RegAssignments[VirtIdx][InstIdx], LiveMap[VirtIdx], true);
-        // }
-
-        InstInserted++;
+        addEdge(std::pair<MCPhysReg, MCPhysReg>{LiveMap[VirtIdx], RegAssignments[VirtIdx][InstIdx]}, VirtIdx);
+        // LLVM_DEBUG(dbgs() << "ADD: " << printReg(LiveMap[VirtIdx]) << " -> " << printReg(RegAssignments[VirtIdx][InstIdx]) << "\n");
         LiveMap[VirtIdx] = RegAssignments[VirtIdx][InstIdx];
       }
 
       insertInstrs(MachineBasicBlock, InsertIt);
-
-      MachineBasicBlock::instr_iterator TmpIt = InsertIt;
-      for (idx_t InstDelta = 1; InstDelta <= InstInserted; ++InstDelta) {
-        TmpIt--;
-        substOperand(TmpIt, InstIdx);
-      }
     }
   }
+
+  // Delete live ranges
 }
 
 int PBORegAllocUpdated::getStackSlot(Register Reg) {
@@ -636,8 +721,38 @@ int PBORegAllocUpdated::getStackSlot(Register Reg) {
   return FrameIdx;
 }
 
+int PBORegAllocUpdated::getStackSlot(const TargetRegisterClass & RegisterClass) {
+  idx_t Size = TargetRegisterInfo->getSpillSize(RegisterClass);
+  Align Alignment = TargetRegisterInfo->getSpillAlign(RegisterClass);
+
+  int FrameIdx = MachineFunction->getFrameInfo().CreateSpillStackObject(Size, Alignment);
+
+  return FrameIdx;
+}
+
+void PBORegAllocUpdated::addMBBLiveIns(void) {
+  for (MachineBasicBlock &MachineBasicBlock : (*MachineFunction)) {
+    if (MachineBasicBlock.empty()) {
+      continue;
+    }
+
+    SlotIndex StartIdx = SlotIndexes->getInstructionIndex(*MachineBasicBlock.getFirstNonDebugInstr());
+
+    for (idx_t VirtIdx : SlotQueue[StartIdx]) {
+      MCPhysReg PhysReg = RegAssignments[VirtIdx][StartIdx];
+
+      if (PhysReg == 0) {
+        continue;
+      }
+
+      MachineBasicBlock.addLiveIn(PhysReg);
+    }
+  }
+}
+
 bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   MachineFunction = &MF;
+  VirtRegMap = &getAnalysis<llvm::VirtRegMap>();
   LiveIntervals = &getAnalysis<llvm::LiveIntervals>();
   LiveRegMatrix = &getAnalysis<llvm::LiveRegMatrix>();
   TargetRegisterInfo = MachineFunction->getSubtarget().getRegisterInfo();
@@ -680,7 +795,6 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   genConflictConditions();
   genEndingRestrictions();
 
-  // genObjectiveFunction();
   mixSwapPenalty();
 
   OpbFile << "*#variable= " << LogVarCount
@@ -702,7 +816,7 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   if (false) { // Timeout goes here
     // Command = SolverCmd = " Default " + std::to_string(Timeout) + " " + OpbFileName
   } else {
-    Command = SolverCmd + " " + OpbFileName;
+    Command = SolverCmd + " " + OpbFileName + " > /dev/null";
   }
 
   system(Command.c_str());
@@ -711,7 +825,12 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   RegAssignments = std::vector<std::map<SlotIndex, MCPhysReg>>();
 
   genAssignments();
+  addMBBLiveIns();
   assignPhysRegisters();
+
+  for (Register VirtReg : VirtRegs) {
+    LiveIntervals->removeInterval(VirtReg);
+  }
 
   return true;
 }
