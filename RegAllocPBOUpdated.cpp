@@ -28,10 +28,12 @@
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/MC/MCInst.h"
@@ -54,8 +56,11 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
+#include <system_error>
 #include <utility>
 #include <vector>
+
+#include "gurobi_c++.h"
 
 using namespace llvm;
 
@@ -89,6 +94,8 @@ class PBORegAllocUpdated : public MachineFunctionPass {
   std::ofstream OpbFile;
   std::fstream ConstraintFile;
   std::string ObjectiveFunction;
+
+  GRBModel *Model;
 
   idx_t LogVarCount;
   idx_t ConstraintCount;
@@ -132,8 +139,16 @@ public:
     );
   }
 
+  MachineFunctionProperties getSetProperties() const override {
+    return MachineFunctionProperties().set(
+        MachineFunctionProperties::Property::NoVRegs
+    );
+  }
+
   std::string genLogVar(void);
   void instrConditions(const MachineInstr &, idx_t, bool);
+
+  void insertEmptyInstr(void);
 
   void genStoreConditions(void);
   void genLiveRestrictions(void);
@@ -239,6 +254,17 @@ void PBORegAllocUpdated::instrConditions(const MachineInstr &Instr, idx_t VirtId
   }
 }
 
+void PBORegAllocUpdated::insertEmptyInstr(void) {
+  for (MachineBasicBlock &MachineBasicBlock : *MachineFunction) {
+    if (!MachineBasicBlock.empty()) {
+      continue;
+    }
+
+    BuildMI(MachineBasicBlock, MachineBasicBlock.begin(), DebugLoc(), TargetInstrInfo->get(TargetOpcode::KILL));
+    SlotIndexes->insertMachineInstrInMaps(MachineBasicBlock.instr_front());
+  }
+}
+
 void PBORegAllocUpdated::genStoreConditions(void) {
   idx_t VirtIdx = 0;
   for (Register VirtReg : VirtRegs) {
@@ -330,8 +356,12 @@ void PBORegAllocUpdated::genEndingRestrictions(void) {
         continue;
       }
 
+      LLVM_DEBUG(dbgs() << "inside: " << Successor->getName() << "\n");
+
       SlotIndex FirstIdx = SlotIndexes->getInstructionIndex(*Successor->getFirstNonDebugInstr()).getBaseIndex();
       std::set<idx_t> *EntryLiveVirts = &SlotQueue[FirstIdx];
+
+      LLVM_DEBUG(dbgs() << "outside\n");
 
       for (idx_t ExitIdx : *ExitLiveVirts) {
         for (idx_t EntryIdx : *EntryLiveVirts) {
@@ -424,22 +454,41 @@ void PBORegAllocUpdated::mixSwapPenalty(void) {
 void PBORegAllocUpdated::genAssignments() {
   std::ifstream File("solution.sol");
 
+  LLVM_DEBUG(dbgs() << "LOG_VAR_COUNT: " << LogVarCount << "\n");
+
   if (File.is_open()) {
     std::string Line;
+
+    LLVM_DEBUG(
+      std::string file_name = "/Users/pierreyan/logs/"+MachineFunction->getName().str()+".sol";
+      dbgs() << "Writing to " << file_name << "\n";
+
+      std::ofstream dst;
+      dst.open(file_name, std::ios::out | std::ios::trunc);
+
+      if (dst.is_open()) {
+        dst << File.rdbuf();
+        dst.close();
+        File.seekg(0);
+      } else {
+        std::cerr << "Failed to open file: " << strerror(errno) << "\n";
+      }
+    );
 
     getline(File, Line);
     for (idx_t Reads = 0; Reads < LogVarCount && getline(File, Line); ++Reads) {
       std::stringstream Stream(Line);
 
       std::string Var, Assignment;
-      Stream >> Var >> Assignment;
+      Stream >> Var >> Assignment; 
 
+      LLVM_DEBUG(dbgs() << "Var: " << Var << " Assignment: " << Assignment << "\n");
       LogVarAssignments[Var] = std::stoi(Assignment) != 0;
     }
 
     File.close();
   } else {
-    // LLVM_DEBUG(dbgs() << "Couldn't open solutions\n");
+    LLVM_DEBUG(dbgs() << "Couldn't open solutions\n");
   }
 
   idx_t VirtIdx = 0;
@@ -679,12 +728,14 @@ void PBORegAllocUpdated::assignPhysRegisters(void) {
       }
 
       clearQueue();
+      std::map<idx_t, MCPhysReg> NewMap = {};
 
       // Moving values to and from stack slots or between registers, as needed
       for (idx_t VirtIdx : SlotQueue[InstIdx]) {
+        NewMap[VirtIdx] = RegAssignments[VirtIdx][InstIdx];
+
         // If new
         if (LiveMap.find(VirtIdx) == LiveMap.end()) {
-          LiveMap[VirtIdx] = RegAssignments[VirtIdx][InstIdx];
           continue;
         }
 
@@ -695,8 +746,9 @@ void PBORegAllocUpdated::assignPhysRegisters(void) {
 
         addEdge(std::pair<MCPhysReg, MCPhysReg>{LiveMap[VirtIdx], RegAssignments[VirtIdx][InstIdx]}, VirtIdx);
         // LLVM_DEBUG(dbgs() << "ADD: " << printReg(LiveMap[VirtIdx]) << " -> " << printReg(RegAssignments[VirtIdx][InstIdx]) << "\n");
-        LiveMap[VirtIdx] = RegAssignments[VirtIdx][InstIdx];
       }
+
+      LiveMap = NewMap;
 
       insertInstrs(MachineBasicBlock, InsertIt);
     }
@@ -791,6 +843,9 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   PhysLogVarSets = std::vector<std::map<SlotIndex, std::map<MCPhysReg, std::string>>>();
   SpillLogVarSets = std::vector<std::map<SlotIndex, std::string>>();
 
+  GRBModel Solver = GRBModel({});
+  Model = &Solver;
+
   genStoreConditions();
   genConflictConditions();
   genEndingRestrictions();
@@ -831,6 +886,8 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   for (Register VirtReg : VirtRegs) {
     LiveIntervals->removeInterval(VirtReg);
   }
+
+  MachineRegisterInfo->clearVirtRegs();
 
   return true;
 }
