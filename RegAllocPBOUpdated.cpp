@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineInstrBundleIterator.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -61,6 +62,7 @@
 #include <vector>
 
 #include "gurobi_c++.h"
+#include "gurobi_c.h"
 
 using namespace llvm;
 
@@ -93,7 +95,7 @@ class PBORegAllocUpdated : public MachineFunctionPass {
 
   std::ofstream OpbFile;
   std::fstream ConstraintFile;
-  std::string ObjectiveFunction;
+  GRBQuadExpr ObjectiveFunction;
 
   GRBModel *Model;
 
@@ -103,10 +105,10 @@ class PBORegAllocUpdated : public MachineFunctionPass {
   std::map<Register, idx_t> VirtIdxes;
 
   std::vector<std::vector<MCPhysReg>> PhysSets;
-  std::vector<std::map<SlotIndex, std::map<MCPhysReg, std::string>>> PhysLogVarSets;
-  std::vector<std::map<SlotIndex, std::string>> SpillLogVarSets;
+  std::vector<std::map<SlotIndex, std::map<MCPhysReg, GRBVar>>> PhysLogVarSets;
+  std::vector<std::map<SlotIndex, GRBVar>> SpillLogVarSets;
 
-  std::map<std::string, bool> LogVarAssignments;
+  // std::map<std::string, bool> LogVarAssignments;
   std::vector<std::map<SlotIndex, MCPhysReg>> RegAssignments;
   std::map<Register, int> StackMapping;
 
@@ -145,15 +147,14 @@ public:
     );
   }
 
-  std::string genLogVar(void);
+  GRBVar genLogVar(void);
   void instrConditions(const MachineInstr &, idx_t, bool);
-
-  void insertEmptyInstr(void);
 
   void genStoreConditions(void);
   void genLiveRestrictions(void);
   void genConflictConditions(void);
   void genEndingRestrictions(void);
+  void genTermRestrictions(void);
 
   void mixSwapPenalty(void);
 
@@ -202,8 +203,8 @@ void PBORegAllocUpdated::getAnalysisUsage(AnalysisUsage &AUsage) const {
   MachineFunctionPass::getAnalysisUsage(AUsage);
 }
 
-std::string PBORegAllocUpdated::genLogVar(void) {
-  return "x" + std::to_string(++LogVarCount);
+GRBVar PBORegAllocUpdated::genLogVar(void) {
+  return Model->addVar(0.0, 1.0, 0.0, GRB_BINARY, "x" + std::to_string(++LogVarCount));
 }
 
 void PBORegAllocUpdated::instrConditions(const MachineInstr &Instr, idx_t VirtIdx, bool Spillable) {
@@ -219,24 +220,30 @@ void PBORegAllocUpdated::instrConditions(const MachineInstr &Instr, idx_t VirtId
 
   RegGroup->second.insert(VirtIdx);
 
-  PhysLogVarSets[VirtIdx][SegIdx] = std::map<MCPhysReg, std::string>();
+  PhysLogVarSets[VirtIdx][SegIdx] = std::map<MCPhysReg, GRBVar>();
 
   idx_t PhysRegCount = PhysSets[VirtIdx].size();
 
+  GRBLinExpr Constraint{};
+
   for (size_t PhysIdx = 0; PhysIdx < PhysRegCount; ++PhysIdx) {
-    std::string LogVar = genLogVar();
+    GRBVar LogVar = genLogVar();
     PhysLogVarSets[VirtIdx][SegIdx][PhysSets[VirtIdx][PhysIdx]] = LogVar;
-    ObjectiveFunction += " -" + std::to_string((PhysRegCount - PhysIdx) / (float) PhysRegCount) + " " + LogVar;
-    ConstraintFile << " +1 " << LogVar;
+    // ObjectiveFunction += " -" + std::to_string((PhysRegCount - PhysIdx) / (float) PhysRegCount) + " " + LogVar;
+    ObjectiveFunction.addTerm(- ((PhysRegCount - PhysIdx) / (float) PhysRegCount), LogVar);
+    // ConstraintFile << " +1 " << LogVar;
+    Constraint += + 1 * LogVar;
   }
 
   if (Spillable) {
-    std::string LogVar = genLogVar();
+    GRBVar LogVar = genLogVar();
     SpillLogVarSets[VirtIdx][SegIdx] = LogVar;
-    ConstraintFile << " +1 " << LogVar;
+    // ConstraintFile << " +1 " << LogVar;
+    Constraint += + 1 * LogVar;
   }
 
-  ConstraintFile << " = 1;\n";
+  // ConstraintFile << " = 1;\n";
+  Model->addConstr(Constraint, GRB_EQUAL, 1);
   ConstraintCount++;
 
   // Implicit Conditions
@@ -245,23 +252,21 @@ void PBORegAllocUpdated::instrConditions(const MachineInstr &Instr, idx_t VirtId
     if (Operand.isRegMask()) {
       for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
         if (Operand.clobbersPhysReg(PhysReg)) {
-          ConstraintFile << " +1 " << PhysLogVarSets[VirtIdx][SegIdx][PhysReg] << " = 0;\n";
+          // ConstraintFile << " +1 " << PhysLogVarSets[VirtIdx][SegIdx][PhysReg] << " = 0;\n";
+          Model->addConstr(PhysLogVarSets[VirtIdx][SegIdx][PhysReg], GRB_EQUAL, 0);
           ConstraintCount++;
         }
       }
-      continue;
+    } 
+    if (Operand.isReg()) {
+      for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
+        if (TargetRegisterInfo->regsOverlap(Operand.getReg(), PhysReg)) {
+          // ConstraintFile << " +1 " << PhysLogVarSets[VirtIdx][SegIdx][PhysReg] << " = 0;\n";
+          Model->addConstr(PhysLogVarSets[VirtIdx][SegIdx][PhysReg], GRB_EQUAL, 0);
+          ConstraintCount++;
+        }
+      }
     }
-  }
-}
-
-void PBORegAllocUpdated::insertEmptyInstr(void) {
-  for (MachineBasicBlock &MachineBasicBlock : *MachineFunction) {
-    if (!MachineBasicBlock.empty()) {
-      continue;
-    }
-
-    BuildMI(MachineBasicBlock, MachineBasicBlock.begin(), DebugLoc(), TargetInstrInfo->get(TargetOpcode::KILL));
-    SlotIndexes->insertMachineInstrInMaps(MachineBasicBlock.instr_front());
   }
 }
 
@@ -289,8 +294,8 @@ void PBORegAllocUpdated::genStoreConditions(void) {
       } 
     }
 
-    PhysLogVarSets.push_back(std::map<SlotIndex, std::map<MCPhysReg, std::string>>());
-    SpillLogVarSets.push_back(std::map<SlotIndex, std::string>());
+    PhysLogVarSets.push_back(std::map<SlotIndex, std::map<MCPhysReg, GRBVar>>());
+    SpillLogVarSets.push_back(std::map<SlotIndex, GRBVar>());
 
     for (MachineRegisterInfo::def_instr_iterator DefIt = MachineRegisterInfo->def_instr_begin(VirtReg);
          DefIt != MachineRegisterInfo::def_instr_end(); ++DefIt) {
@@ -321,16 +326,17 @@ void PBORegAllocUpdated::genStoreConditions(void) {
 }
 
 void PBORegAllocUpdated::genConflictConditions(void) {
-  ConstraintFile << "* Confliction Restrictions\n";
+  // ConstraintFile << "* Confliction Restrictions\n";`
   for (slot_queue_t::iterator SlotIt = SlotQueue.begin(); SlotIt != SlotQueue.end(); ++SlotIt) {
     for (std::set<idx_t>::iterator RegIt1 = SlotIt->second.begin(); RegIt1 != SlotIt->second.end(); ++RegIt1) {
       for (std::set<idx_t>::iterator RegIt2 = std::next(RegIt1, 1); RegIt2 != SlotIt->second.end(); ++RegIt2) {
         for (MCPhysReg PhysReg1 : PhysSets[*RegIt1]) {
           for (MCPhysReg PhysReg2 : PhysSets[*RegIt2]) {
             if (TargetRegisterInfo->regsOverlap(PhysReg1, PhysReg2)) {
-              ConstraintFile << " +1 " << PhysLogVarSets[*RegIt1][SlotIt->first][PhysReg1] 
-                             << " +1 " << PhysLogVarSets[*RegIt2][SlotIt->first][PhysReg2]
-                             << " <= 1;\n";
+            //   ConstraintFile << " +1 " << PhysLogVarSets[*RegIt1][SlotIt->first][PhysReg1] 
+            //                  << " +1 " << PhysLogVarSets[*RegIt2][SlotIt->first][PhysReg2]
+            //                  << " <= 1;\n";
+              Model->addConstr(PhysLogVarSets[*RegIt1][SlotIt->first][PhysReg1] + PhysLogVarSets[*RegIt2][SlotIt->first][PhysReg2], GRB_LESS_EQUAL, 1);
 
               ConstraintCount++;
             }
@@ -348,7 +354,13 @@ void PBORegAllocUpdated::genEndingRestrictions(void) {
       continue;
     }
 
-    SlotIndex LastIdx = SlotIndexes->getInstructionIndex(*BasicBlock.getLastNonDebugInstr()).getBaseIndex();
+    MachineInstrBundleIterator<MachineInstr> InstrIt = BasicBlock.getLastNonDebugInstr();
+    while (InstrIt->isTerminator() && InstrIt != BasicBlock.instr_begin() && std::prev(InstrIt)->isTerminator()) {
+      InstrIt--;
+    }
+
+    SlotIndex LastIdx = SlotIndexes->getInstructionIndex(*InstrIt).getBaseIndex();
+
     std::set<idx_t> *ExitLiveVirts = &SlotQueue[LastIdx];
 
     for (MachineBasicBlock *Successor : BasicBlock.successors()) {
@@ -356,12 +368,8 @@ void PBORegAllocUpdated::genEndingRestrictions(void) {
         continue;
       }
 
-      LLVM_DEBUG(dbgs() << "inside: " << Successor->getName() << "\n");
-
       SlotIndex FirstIdx = SlotIndexes->getInstructionIndex(*Successor->getFirstNonDebugInstr()).getBaseIndex();
       std::set<idx_t> *EntryLiveVirts = &SlotQueue[FirstIdx];
-
-      LLVM_DEBUG(dbgs() << "outside\n");
 
       for (idx_t ExitIdx : *ExitLiveVirts) {
         for (idx_t EntryIdx : *EntryLiveVirts) {
@@ -376,14 +384,47 @@ void PBORegAllocUpdated::genEndingRestrictions(void) {
                 continue;
               }
 
-              ConstraintFile << " +1 " << PhysLogVarSets[ExitIdx][LastIdx][PhysReg1]
-                             << " -1 " << PhysLogVarSets[EntryIdx][FirstIdx][PhysReg2]
-                             << " = 0;\n";
+              // ConstraintFile << " +1 " << PhysLogVarSets[ExitIdx][LastIdx][PhysReg1]
+              //                << " -1 " << PhysLogVarSets[EntryIdx][FirstIdx][PhysReg2]
+              //                << " = 0;\n";
+              Model->addConstr(PhysLogVarSets[ExitIdx][LastIdx][PhysReg1], GRB_EQUAL, PhysLogVarSets[EntryIdx][FirstIdx][PhysReg2]);
               ConstraintCount++;
             }
           }
         }
       }
+    }
+  }
+}
+
+void PBORegAllocUpdated::genTermRestrictions(void) {
+  for (MachineBasicBlock &BasicBlock : *MachineFunction) {
+    if (BasicBlock.empty()) {
+      continue;
+    }
+
+    MachineInstrBundleIterator<MachineInstr> LastTermIt = BasicBlock.getLastNonDebugInstr();
+    MachineInstrBundleIterator<MachineInstr> TermIt = LastTermIt;
+
+    SlotIndex LastIdx = SlotIndexes->getInstructionIndex(*LastTermIt);
+    
+    while (TermIt->isTerminator()) {
+      SlotIndex SegIdx = SlotIndexes->getInstructionIndex(*TermIt);
+      for (idx_t VirtIdx : SlotQueue[SegIdx]) {
+        if (SlotQueue[LastIdx].find(VirtIdx) == SlotQueue[LastIdx].end()) {
+          continue;
+        }
+
+        for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
+          Model->addConstr(PhysLogVarSets[VirtIdx][LastIdx][PhysReg], GRB_EQUAL, PhysLogVarSets[VirtIdx][SegIdx][PhysReg]);
+        }
+      }
+
+      if (TermIt == BasicBlock.begin()) {
+        break;
+      }
+
+      TermIt--;
     }
   }
 }
@@ -398,8 +439,8 @@ void PBORegAllocUpdated::mixSwapPenalty(void) {
     SlotIndex StartIdx = SlotIndexes->getInstructionIndex(StartInstr);
     double Expected = 20 * MachineBlockFrequencyInfo->getBlockFreqRelativeToEntryBlock(&MachineBasicBlock);
 
-    std::map<idx_t, std::map<MCPhysReg, std::string>> PrevMap = {};
-    std::map<idx_t, std::string> PrevSpill = {};
+    std::map<idx_t, std::map<MCPhysReg, GRBVar>> PrevMap = {};
+    std::map<idx_t, GRBVar> PrevSpill = {};
 
     for (idx_t VirtIdx : SlotQueue[StartIdx]) {
       for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
@@ -419,8 +460,8 @@ void PBORegAllocUpdated::mixSwapPenalty(void) {
 
       SlotIndex Idx = SlotIndexes->getInstructionIndex(*InstIt);
 
-      std::map<idx_t, std::map<MCPhysReg, std::string>> CurMap = {};
-      std::map<idx_t, std::string> CurSpill = {};
+      std::map<idx_t, std::map<MCPhysReg, GRBVar>> CurMap = {};
+      std::map<idx_t, GRBVar> CurSpill = {};
 
       for (idx_t VirtIdx : SlotQueue[Idx]) {
         if (PrevMap.find(VirtIdx) == PrevMap.end()) {
@@ -429,7 +470,8 @@ void PBORegAllocUpdated::mixSwapPenalty(void) {
         }
 
         for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
-          ObjectiveFunction += " -" + std::to_string(Expected) + " " + PrevMap[VirtIdx][PhysReg] + " " + PhysLogVarSets[VirtIdx][Idx][PhysReg];
+          // ObjectiveFunction += " -" + std::to_string(Expected) + " " + PrevMap[VirtIdx][PhysReg] + " " + PhysLogVarSets[VirtIdx][Idx][PhysReg];
+          ObjectiveFunction.addTerm(-Expected, PrevMap[VirtIdx][PhysReg], PhysLogVarSets[VirtIdx][Idx][PhysReg]);
         }
 
         bool CanSpill = SpillLogVarSets[VirtIdx].find(Idx) != SpillLogVarSets[VirtIdx].end();
@@ -438,7 +480,8 @@ void PBORegAllocUpdated::mixSwapPenalty(void) {
           CurSpill[VirtIdx] =  SpillLogVarSets[VirtIdx][Idx];
 
           if (PrevSpill.find(VirtIdx) != PrevSpill.end()) {
-            ObjectiveFunction += " -" + std::to_string(Expected / 2) + " " + PrevSpill[VirtIdx] + " " + CurSpill[VirtIdx];
+            // ObjectiveFunction += " -" + std::to_string(Expected / 2) + " " + PrevSpill[VirtIdx] + " " + CurSpill[VirtIdx];
+            ObjectiveFunction.addTerm(-(Expected / 2), PrevSpill[VirtIdx], CurSpill[VirtIdx]);
           }
         }
 
@@ -452,44 +495,48 @@ void PBORegAllocUpdated::mixSwapPenalty(void) {
 }
 
 void PBORegAllocUpdated::genAssignments() {
-  std::ifstream File("solution.sol");
+  // std::ifstream File("solution.sol");
 
-  LLVM_DEBUG(dbgs() << "LOG_VAR_COUNT: " << LogVarCount << "\n");
+  // LLVM_DEBUG(dbgs() << "LOG_VAR_COUNT: " << LogVarCount << "\n");
 
-  if (File.is_open()) {
-    std::string Line;
+  // if (File.is_open()) {
+  //   std::string Line;
 
-    LLVM_DEBUG(
-      std::string file_name = "/Users/pierreyan/logs/"+MachineFunction->getName().str()+".sol";
-      dbgs() << "Writing to " << file_name << "\n";
+  //   LLVM_DEBUG(
+  //     std::string file_name = "/Users/pierreyan/logs/"+MachineFunction->getName().str()+".sol";
+  //     dbgs() << "Writing to " << file_name << "\n";
 
-      std::ofstream dst;
-      dst.open(file_name, std::ios::out | std::ios::trunc);
+  //     std::ofstream dst;
+  //     dst.open(file_name, std::ios::out | std::ios::trunc);
 
-      if (dst.is_open()) {
-        dst << File.rdbuf();
-        dst.close();
-        File.seekg(0);
-      } else {
-        std::cerr << "Failed to open file: " << strerror(errno) << "\n";
-      }
-    );
+  //     if (dst.is_open()) {
+  //       dst << File.rdbuf();
+  //       dst.close();
+  //       File.seekg(0);
+  //     } else {
+  //       std::cerr << "Failed to open file: " << strerror(errno) << "\n";
+  //     }
+  //   );
 
-    getline(File, Line);
-    for (idx_t Reads = 0; Reads < LogVarCount && getline(File, Line); ++Reads) {
-      std::stringstream Stream(Line);
+  //   getline(File, Line);
+  //   for (idx_t Reads = 0; Reads < LogVarCount && getline(File, Line); ++Reads) {
+  //     std::stringstream Stream(Line);
 
-      std::string Var, Assignment;
-      Stream >> Var >> Assignment; 
+  //     std::string Var, Assignment;
+  //     Stream >> Var >> Assignment; 
 
-      LLVM_DEBUG(dbgs() << "Var: " << Var << " Assignment: " << Assignment << "\n");
-      LogVarAssignments[Var] = std::stoi(Assignment) != 0;
-    }
+  //     LLVM_DEBUG(dbgs() << "Var: " << Var << " Assignment: " << Assignment << "\n");
+  //     LogVarAssignments[Var] = std::stoi(Assignment) != 0;
+  //   }
 
-    File.close();
-  } else {
-    LLVM_DEBUG(dbgs() << "Couldn't open solutions\n");
-  }
+  //   File.close();
+  // } else {
+  //   LLVM_DEBUG(dbgs() << "Couldn't open solutions\n");
+  // }
+
+  Model->write("/Users/pierreyan/logs/" + MachineFunction->getName().str() + ".opb");
+  Model->optimize();
+  // Model->write("solution.sol");
 
   idx_t VirtIdx = 0;
   for (Register VirtReg : VirtRegs) {
@@ -510,9 +557,13 @@ void PBORegAllocUpdated::genAssignments() {
         RegAssignments[VirtIdx][SegIdx] = 0;
         // LLVM_DEBUG(dbgs() << printReg(VirtRegs[VirtIdx]) << " <- ");
         for (MCPhysReg PhysReg : PhysSets[VirtIdx]) {
-          if (LogVarAssignments[PhysLogVarSets[VirtIdx][SegIdx][PhysReg]]) {
+          // if (LogVarAssignments[PhysLogVarSets[VirtIdx][SegIdx][PhysReg]]) {
+          //   RegAssignments[VirtIdx][SegIdx] = PhysReg;
+          //   // LLVM_DEBUG(dbgs() << printReg(PhysReg) << "\n");
+          //   break;
+          // }
+          if (PhysLogVarSets[VirtIdx][SegIdx][PhysReg].get(GRB_DoubleAttr_X) == 1.0) {
             RegAssignments[VirtIdx][SegIdx] = PhysReg;
-            // LLVM_DEBUG(dbgs() << printReg(PhysReg) << "\n");
             break;
           }
           // LLVM_DEBUG(dbgs() << "0\n");
@@ -550,7 +601,7 @@ void PBORegAllocUpdated::substOperand(MachineBasicBlock::instr_iterator &Inst, S
 }
 
 void PBORegAllocUpdated::addEdge(std::pair<MCPhysReg, MCPhysReg> Move, idx_t VirtIdx) {
-  LLVM_DEBUG(dbgs() << "Move: " << printReg(Move.first) << " -> " << printReg(Move.second) << "\n");
+  // LLVM_DEBUG(dbgs() << "Move: " << printReg(Move.first) << " -> " << printReg(Move.second) << "\n");
   if (Move.second == 0) {
     ToZero.push_back(std::pair<MCPhysReg, idx_t>{Move.first, VirtIdx});
     return;
@@ -595,7 +646,7 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
 
     TargetInstrInfo->storeRegToStackSlot(MachineBasicBlock, InsertIt, Blunt.first, true, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
     SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-    // LLVM_DEBUG(dbgs() << printReg(Blunt.first) << " -> " << "0" << "\n");
+    LLVM_DEBUG(dbgs() << printReg(Blunt.first) << " -> " << "0" << "\n");
 
     MCPhysReg CurReg = Blunt.first;
     while (DestToSrc.find(CurReg) != DestToSrc.end()) {
@@ -604,7 +655,7 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
       if (SrcReg != 0) {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), CurReg, SrcReg, true);
         SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-        // LLVM_DEBUG(dbgs() << printReg(SrcReg) << " -> " << printReg(CurReg) << "\n");
+        LLVM_DEBUG(dbgs() << printReg(SrcReg) << " -> " << printReg(CurReg) << "\n");
       } else {
         VirtReg = VirtRegs[DestToReg[CurReg]];
         FrameIdx = getStackSlot(VirtReg);
@@ -612,7 +663,7 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
 
         TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, CurReg, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
         SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-        // LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(CurReg) << "\n");
+        LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(CurReg) << "\n");
       }
 
       Starts[CurReg] = true;
@@ -646,19 +697,19 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
     }
 
     if (Cycle) {
-      // LLVM_DEBUG(dbgs() << "CYCLE!\n");
+      LLVM_DEBUG(dbgs() << "CYCLE!\n");
       Register VirtReg = VirtRegs[DestToReg[Start.first]];
       int FrameIdx = getStackSlot(*MachineRegisterInfo->getRegClass(VirtReg));
       const TargetRegisterClass &RegisterClass = *MachineRegisterInfo->getRegClass(VirtReg);
 
       TargetInstrInfo->storeRegToStackSlot(MachineBasicBlock, InsertIt, Start.first, true, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
       SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-      // LLVM_DEBUG(dbgs() << printReg(Start.first) << " -> " << "0" << "\n");
+      LLVM_DEBUG(dbgs() << printReg(Start.first) << " -> " << "0" << "\n");
 
       for (idx_t Idx = 0; Idx < Stack.size() - 1; ++Idx) {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), Stack[Idx], Stack[Idx+1], true);
         SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-        // LLVM_DEBUG(dbgs() << printReg(Stack[Idx+1]) << " -> " << printReg(Stack[Idx]) << "\n");
+        LLVM_DEBUG(dbgs() << printReg(Stack[Idx+1]) << " -> " << printReg(Stack[Idx]) << "\n");
       }
 
       MCPhysReg LastReg = Stack[Stack.size()-1];
@@ -668,12 +719,12 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
 
       TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, LastReg, FrameIdx, &LastRegisterClass, TargetRegisterInfo, Register());
       SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-      // LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(LastReg) << "\n");
+      LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(LastReg) << "\n");
     } else {
       for (idx_t Idx = 0; Idx < Stack.size() - 1; ++Idx) {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), Stack[Idx], Stack[Idx+1], true);
         SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-        // LLVM_DEBUG(dbgs() << printReg(Stack[Idx+1]) << " -> " << printReg(Stack[Idx]) << "\n");
+        LLVM_DEBUG(dbgs() << printReg(Stack[Idx+1]) << " -> " << printReg(Stack[Idx]) << "\n");
       }
       
       MCPhysReg LastReg = Stack[Stack.size()-1];
@@ -685,11 +736,11 @@ void PBORegAllocUpdated::insertInstrs(MachineBasicBlock &MachineBasicBlock, llvm
 
         TargetInstrInfo->loadRegFromStackSlot(MachineBasicBlock, InsertIt, LastReg, FrameIdx, &RegisterClass, TargetRegisterInfo, Register());
         SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-        // LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(LastReg) << "\n");
+        LLVM_DEBUG(dbgs() << "0" << " -> " << printReg(LastReg) << "\n");
       } else {
         TargetInstrInfo->copyPhysReg(MachineBasicBlock, InsertIt, InsertIt->getDebugLoc(), LastReg, DestToSrc[LastReg], true);
         SlotIndexes->insertMachineInstrInMaps(*std::prev(InsertIt));
-        // LLVM_DEBUG(dbgs() << printReg(DestToSrc[LastReg]) << " -> " << printReg(LastReg) << "\n");
+        LLVM_DEBUG(dbgs() << printReg(DestToSrc[LastReg]) << " -> " << printReg(LastReg) << "\n");
 
       }
     }
@@ -802,6 +853,8 @@ void PBORegAllocUpdated::addMBBLiveIns(void) {
   }
 }
 
+GRBEnv Env = GRBEnv();
+
 bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   MachineFunction = &MF;
   VirtRegMap = &getAnalysis<llvm::VirtRegMap>();
@@ -828,7 +881,8 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   LogVarCount = 0;
   ConstraintCount = 0;
 
-  ObjectiveFunction = "min:";
+  // ObjectiveFunction = "min:";
+  ObjectiveFunction = GRBQuadExpr();
 
   std::string OpbFileName = MachineFunction->getName().str() + "_problem.opb";
   std::string ConFileName = MachineFunction->getName().str() + "_constraints.txt";
@@ -840,43 +894,49 @@ bool PBORegAllocUpdated::runOnMachineFunction(class MachineFunction &MF) {
   VirtIdxes = std::map<Register, idx_t>();
 
   PhysSets = std::vector<std::vector<MCPhysReg>>();
-  PhysLogVarSets = std::vector<std::map<SlotIndex, std::map<MCPhysReg, std::string>>>();
-  SpillLogVarSets = std::vector<std::map<SlotIndex, std::string>>();
+  // PhysLogVarSets = std::vector<std::map<SlotIndex, std::map<MCPhysReg, std::string>>>();
+  PhysLogVarSets = std::vector<std::map<SlotIndex, std::map<MCPhysReg, GRBVar>>>();
+  // SpillLogVarSets = std::vector<std::map<SlotIndex, std::string>>();
+  SpillLogVarSets = std::vector<std::map<SlotIndex, GRBVar>>();
 
-  GRBModel Solver = GRBModel({});
+  GRBModel Solver = GRBModel(Env);
   Model = &Solver;
+  Model->getEnv().set(GRB_DoubleParam_TimeLimit, 60);
 
   genStoreConditions();
   genConflictConditions();
   genEndingRestrictions();
+  genTermRestrictions();
 
   mixSwapPenalty();
 
-  OpbFile << "*#variable= " << LogVarCount
-          << " #constraint= " << ConstraintCount
-          << "\n* constraints for function " << MachineFunction->getName().str()
-          << "\n";
-  OpbFile << ObjectiveFunction << ";\n";
+  // OpbFile << "*#variable= " << LogVarCount
+  //         << " #constraint= " << ConstraintCount
+  //         << "\n* constraints for function " << MachineFunction->getName().str()
+  //         << "\n";
+  // OpbFile << ObjectiveFunction << ";\n";
 
-  ConstraintFile.close();
-  std::ifstream ConstraintInFile;
-  ConstraintInFile.open(ConFileName);
-  OpbFile << ConstraintInFile.rdbuf();
-  ConstraintInFile.close();
-  OpbFile.close();
+  // ConstraintFile.close();
+  // std::ifstream ConstraintInFile;
+  // ConstraintInFile.open(ConFileName);
+  // OpbFile << ConstraintInFile.rdbuf();
+  // ConstraintInFile.close();
+  // OpbFile.close();
 
-  std::string SolverCmd(SOLVER_COMMAND);
-  std::string Command;
+  // std::string SolverCmd(SOLVER_COMMAND);
+  // std::string Command;
 
-  if (false) { // Timeout goes here
-    // Command = SolverCmd = " Default " + std::to_string(Timeout) + " " + OpbFileName
-  } else {
-    Command = SolverCmd + " " + OpbFileName + " > /dev/null";
-  }
+  // if (false) { // Timeout goes here
+  //   // Command = SolverCmd = " Default " + std::to_string(Timeout) + " " + OpbFileName
+  // } else {
+  //   Command = SolverCmd + " " + OpbFileName + " > /dev/null";
+  // }
 
-  system(Command.c_str());
+  // system(Command.c_str());
 
-  LogVarAssignments = std::map<std::string, bool>();
+  Model->setObjective(ObjectiveFunction);
+
+  // LogVarAssignments = std::map<std::string, bool>();
   RegAssignments = std::vector<std::map<SlotIndex, MCPhysReg>>();
 
   genAssignments();
